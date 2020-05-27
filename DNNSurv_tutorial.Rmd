@@ -1,0 +1,170 @@
+---
+title: "Implementation and evaluation of Cox-based DNN survival prediction model (DNNSurv)"
+author: 
+- Codes by Tao Sun
+- Compiled by Yue Wei
+date: "`r Sys.Date()`"
+vignette: >
+  %\VignetteIndexEntry{Intro to Cox-based DNN survival prediction model}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\usepackage[utf8]{inputenc}
+---
+```{r message = FALSE, echo = FALSE}
+knitr::opts_chunk$set(
+  fig.width = 4,
+  fig.height = 3
+)
+```
+The DNNSurv model is a multi-layer deep neural network survival model to effectively extract features and make accurate and interpretable survival predictions. The model is backed by Tensorflow and Keras to ensure high computational efficiency. Various evaluation metrics, including C-index, time-dependent AUC, and time-dependent Brier score, are also implemented to evaluate the prediction performance. To interpret the deep learning model, the subject-level feature importance measure is calculated and visualized using the Local Interpretable Model-Agnostic Explanation (LIME) algorithm. In this tutorial, we illustrate and evaluate the DNNSurv model in two simulated right-censored datasets. The R Package will soon be available on Github (github.com/yingding99).
+
+# Installation
+The first step is to install TensorFlow on your system. The version used in this tutorial is the latest version 2.2.0. Note that on Windows, OS, and Linux systems, Anaconda or miniconda installation is needed. Details can be found at [here](http://tensorflow.rstudio.com/installation).
+```{r eval=FALSE}
+install.packages("tensorflow")
+library(tensorflow)
+install_tensorflow(method = "conda")
+```
+You can confirm the installation is successful by:
+```{r warning=TRUE}
+library(tensorflow)
+tf$config$experimental_run_functions_eagerly(TRUE)
+tf$constant("Hello Tensorflow")
+```
+
+# Install Keras
+DNNSurv uses the Keras API, which provides user friendly interface with Tensorflow. 
+```{r eval=FALSE}
+library(devtools)
+devtools::install_github("rstudio/keras")
+library(keras)
+install_keras(method = "conda")
+```
+
+```{r}
+library(keras)
+```
+
+# Load utility functions (including loss function) and two simulated data sets
+Multiple utility functions are needed for building and evaluating the model. In particular, the customized loss function is the negative partial log-likelihood based on the Cox model with the L1 penalty. Efron's approximation is used to handle tied events. Two independently simulated right-censored datasets are loaded with one for training and the other for testing. We train our DNNSurv model in the training data and evaluate it in the test data.
+
+```{r}
+source("fun_util.R")
+load("TrainData.RData")
+load("TestData.RData")
+```
+Both training and test data contain 1,000 subjects and 503 variables, including id, survival time, event status (1 for event, 0 for right-censoring), and 500 predictors. Within the 500 predictors, most have zero effects on survival, except for x1, x2, x3, x4, and x5, where these five features positively contribute to the hazard function. The datasets are further processed into X (predictors) and Y (time and status) before feeding to the model. 
+
+```{r}
+x_dat = as.matrix(TrainData[, -which(colnames(TrainData) %in% c("id","time","event"))], nrow = nrow(TrainData))
+y_dat = as.matrix(TrainData[, c("time","event")], nrow = nrow(TrainData))
+
+x_val = as.matrix(TestData[, -which(colnames(TestData) %in% c("id","time","event"))], nrow = nrow(TestData))
+y_val = as.matrix(TestData[, c("time","event")], nrow = nrow(TestData))
+```
+
+# Model construction
+The following chunk demonstrates the architecture of the neural network model in DNNSurv, which uses a sequential model that groups a linear stack of layers. In the following example, we specify three layers in addition to the input layer: two hidden layers and one output layer. For each hidden layer, there are 30 nodes (via num_nodes) fully connected to the neighboring layers. Scaled Exponential Linear Unit (SeLU) is chosen as the activation function throughout the neural network (via string_activation). The L1 penalty is applied to the estimation of the weights in the network (via num_l1). The parameter num_lr controls the learning rate in the optimization process. The number of epochs (via num_epoch) determines how many times the DNN model processes the entire training samples. To enhance computational speed, samples are loaded into the model in batches, with the size of the batch being controlled by the batch_size parameter. The key of the method is the customized negative Cox partial likelihood-based loss function, which is previously loaded in "fun_util.R". The metrics are set to NULL because the c-index, time-dependent AUC, and time-dependent Brier score are calculated afterward. 
+
+```{r}
+### set up DNN parameters ###
+num_nodes <- 30 # number of nodes per hidden layer
+string_activation <- "selu" # activation function
+num_l1 <- 0.1 # L1 penalty
+num_lr <- 0.01 # learning rate
+num_epoch <- 80 # number of epoches for optimization
+batch_size <- 50 # number of batch size for optimization
+```
+
+```{r warning=FALSE}
+rm(model)
+model <- keras_model_sequential() %>%
+  layer_dense(units = num_nodes, activation = string_activation, input_shape = c(ncol(x_dat)), kernel_regularizer = regularizer_l1(num_l1)) %>%
+  layer_dense(units = num_nodes, activation = string_activation, kernel_regularizer = regularizer_l1(num_l1)) %>%
+  layer_dense(units = 1, activation = string_activation)
+```
+
+```{r warning=FALSE}
+summary(model)
+
+model %>% compile(
+  optimizer = optimizer_rmsprop(lr = num_lr),
+  loss = loss_lik_efron,
+  metrics = NULL)
+```
+
+# Run DNN survival model
+The total computing time is within one hour using a PC with one CPU and 8GB memory.
+```{r fig.width = 5.2, message = FALSE,warning=FALSE}
+history <- model %>% fit(x_dat, y_dat, epochs = num_epoch, batch_size = batch_size)
+plot(history)
+```
+
+# Evaluate prediction performance in test data using c-index
+The c-index is a concordance measure (0 to 1). A higher c-index means better prediction performance.
+```{r}
+library(survival)
+y_val_pred <- model %>% predict(x_val)
+y_val <- data.frame(y_val)
+colnames(y_val) = c("time","event")
+out = survConcordance(Surv(time, event) ~ y_val_pred, data = y_val)
+cindex = (out$stats["concordant"] + 0.5*out$stats["tied.risk"])/(out$stats["concordant"] + out$stats["discordant"] + out$stats["tied.risk"])
+cindex
+```
+
+# Evaluate prediction performance in test data using the time-dependent Brier score
+The Brier score is essentially a prediction error metric. It is a dynamic and time-dependent metric. A value of 0.33 suggests that the model is predicting randomly. We examine the Brier score at time = 1, 2, and 3. 
+```{r}
+library(pec)
+y_dat_pred <- model %>% predict(x_dat)
+y_val_pred <- model %>% predict(x_val)
+
+brier <- brier_efron(y_train_true = y_dat,
+                     y_train_pred = y_dat_pred,
+                     y_newdata = y_val,
+                     y_newdata_pred = y_val_pred,
+                     times = c(1,2,3))
+brier$bs
+```
+
+# Evaluate prediction performance in test data using the time-dependent AUC
+In survival prediction, we can obtain AUC values across time. 
+```{r}
+library(survivalROC)
+lp_nn <- data.frame(y_val, y_val_pred)
+colnames(lp_nn) = c("time", "event", "lp")
+auc_nn = NULL
+for (t in c(1,2,3)) {
+  auc_nn = c(auc_nn, survivalROC.C(Stime = lp_nn$time, status = lp_nn$event, marker = lp_nn$lp, predict.time = t, span = 0.05)$AUC)
+}
+auc_nn <- data.frame(time = c(1,2,3), auc = auc_nn)
+auc_nn
+```
+
+# LIME interpretation in test data: individual-level predictor importance
+The Local Interpretable Model-agnostic Explanation (LIME) provides a prediction importance measure for each predictor in each subject by perturbing the predictor and evaluating how the prediction result changes. For the first time, we implement LIME to interpret importance under the survival prediction setting. 
+```{r warning=FALSE}
+library(lime)
+explainer <- lime::lime(
+  x              = data.frame(x_dat),
+  model          = model,
+  bin_continuous = F)
+
+memory.limit(size=15000) #increase the memory limit for this step if "Error: cnnot allocate vector of size" appears.
+start_time <- Sys.time()
+explanation <- lime::explain(
+  x = data.frame(x_val),
+  explainer    = explainer,
+  n_features   = 20,
+  feature_select = "auto",
+  n_permutations = 1000)
+end_time <- Sys.time()
+
+end_time - start_time
+```
+
+The plot is a presentation of importance measures in selected predictors (in rows) across test data samples (in columns). In this simulated setting, the survival outcome is associated with predictors x1-x5, which are correctly characterized in the plot.
+```{r warning=FALSE}
+explanation_plot <- explanation[explanation$feature_desc %in% c("x1","x2","x3","x4","x5","x6","x7","x8","x9","x10"), ]
+plot_explanations(explanation_plot)
+```
+
